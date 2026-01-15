@@ -1,13 +1,13 @@
 import streamlit as st
 import pandas as pd
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values  # execute_values eklendi
 import calendar
 import uuid
 from datetime import datetime, timedelta, date
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="Vardiya ERP Ultimate", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Vardiya ERP Ultimate", page_icon="⚡", layout="wide")
 
 # CSS (Görsel Düzenlemeler)
 st.markdown("""
@@ -23,7 +23,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- VERİTABANI BAĞLANTISI ---
+# --- VERİTABANI BAĞLANTISI (CACHED / ÖNBELLEKLİ) ---
+# Bu kısım bağlantıyı hafızada tutar, her işlemde tekrar bağlanmaz.
+@st.cache_resource
 def get_db_connection():
     try:
         conn = psycopg2.connect(
@@ -65,11 +67,11 @@ def init_db():
     add_column_safe(c, "salary_payments", "payment_type", "TEXT DEFAULT 'monthly'")
     
     conn.commit()
-    conn.close()
+    # conn.close()  <-- KAPATMIYORUZ! Cache bozulur.
 
 init_db()
 
-# --- FİNANSAL MOTOR (BORÇ HESABI) ---
+# --- FİNANSAL MOTOR ---
 def calculate_obligations():
     conn = get_db_connection()
     c = conn.cursor()
@@ -101,66 +103,42 @@ def calculate_obligations():
                     c.execute("SELECT id FROM salary_payments WHERE pro_id=%s AND month_year=%s AND payment_type='weekly'", (p['id'], wk))
                     if not c.fetchone(): salary_debt_val += p['weekly_salary']
                 tmp += timedelta(days=1)
-                
-    conn.close()
     return piece_debt_val, salary_debt_val
 
-# --- YENİ: AYLIK KÂR/ZARAR MOTORU ---
 def calculate_monthly_profit(month, year):
     conn = get_db_connection()
     c = conn.cursor()
-    
-    # Tarih formatı: %.MM.YYYY (SQL Like sorgusu için)
     date_pattern = f"%.{month:02d}.{year}"
     
-    # 1. İŞ GELİRLERİ (Tahakkuk Eden - Yani o ay yapılmış tüm işlerin geliri)
     c.execute("SELECT SUM(price_customer) FROM jobs WHERE date LIKE %s", (date_pattern,))
     res = c.fetchone()
-    total_income_jobs = float(res['sum']) if res and res['sum'] else 0.0
+    inc_jobs = float(res['sum']) if res and res['sum'] else 0.0
     
-    # 2. İŞ GİDERLERİ (Parça Başı Personel)
     c.execute("SELECT SUM(price_worker) FROM jobs WHERE date LIKE %s", (date_pattern,))
     res = c.fetchone()
-    total_expense_jobs = float(res['sum']) if res and res['sum'] else 0.0
+    exp_jobs = float(res['sum']) if res and res['sum'] else 0.0
     
-    # 3. EKSTRA GELİRLER (Transactions)
     c.execute("SELECT SUM(amount) FROM transactions WHERE type='income' AND date LIKE %s", (date_pattern,))
     res = c.fetchone()
-    total_income_extra = float(res['sum']) if res and res['sum'] else 0.0
+    inc_ext = float(res['sum']) if res and res['sum'] else 0.0
     
-    # 4. EKSTRA GİDERLER (Transactions + Expenses Tablosu varsa)
     c.execute("SELECT SUM(amount) FROM transactions WHERE type='expense' AND date LIKE %s", (date_pattern,))
     res = c.fetchone()
-    total_expense_extra = float(res['sum']) if res and res['sum'] else 0.0
+    exp_ext = float(res['sum']) if res and res['sum'] else 0.0
     
-    # 5. MAAŞ GİDERLERİ (SABİT)
     c.execute("SELECT salary, weekly_salary FROM professionals")
     pros = c.fetchall()
     
-    total_salary_monthly = 0
-    total_salary_weekly = 0
-    
-    # O aydaki Pazartesi sayısını bul
+    sal_m = 0
+    sal_w = 0
     num_days = calendar.monthrange(year, month)[1]
-    mondays_count = 0
-    for day in range(1, num_days + 1):
-        if date(year, month, day).weekday() == 0:
-            mondays_count += 1
+    mondays = sum(1 for day in range(1, num_days + 1) if date(year, month, day).weekday() == 0)
             
     for p in pros:
-        # Aylık Maaş (Her ay 1 kere gider yazılır)
-        if p['salary'] > 0:
-            total_salary_monthly += p['salary']
-        # Haftalık Maaş (O aydaki pazartesi sayısı kadar gider yazılır)
-        if p['weekly_salary'] > 0:
-            total_salary_weekly += (p['weekly_salary'] * mondays_count)
+        if p['salary'] > 0: sal_m += p['salary']
+        if p['weekly_salary'] > 0: sal_w += (p['weekly_salary'] * mondays)
             
-    conn.close()
-    
-    total_income = total_income_jobs + total_income_extra
-    total_expense = total_expense_jobs + total_expense_extra + total_salary_monthly + total_salary_weekly
-    
-    return total_income, total_expense
+    return (inc_jobs + inc_ext), (exp_jobs + exp_ext + sal_m + sal_w)
 
 def get_financial_report_df():
     conn = get_db_connection()
@@ -170,22 +148,20 @@ def get_financial_report_df():
     c.execute("SELECT * FROM transactions")
     for t in c.fetchall():
         f = 1 if t['type']=='income' else -1
-        data.append({"Tarih": t['date'], "Tür": "Manuel İşlem", "Açıklama": t['description'], "Tutar": t['amount']*f})
+        data.append({"Tarih": t['date'], "Tür": "Manuel", "Açıklama": t['description'], "Tutar": t['amount']*f})
 
     c.execute("SELECT j.date, j.price_customer, c.name FROM jobs j JOIN customers c ON j.customer_id=c.id WHERE j.is_collected=1 AND j.price_customer > 0")
     for j in c.fetchall():
-        data.append({"Tarih": j['date'], "Tür": "İş Geliri", "Açıklama": f"Tahsilat: {j['name']}", "Tutar": j['price_customer']})
+        data.append({"Tarih": j['date'], "Tür": "İş Geliri", "Açıklama": f"{j['name']}", "Tutar": j['price_customer']})
     
     c.execute("SELECT j.date, j.price_worker, j.job_type FROM jobs j WHERE j.is_worker_paid=1 AND j.price_worker > 0")
     for j in c.fetchall():
-        data.append({"Tarih": j['date'], "Tür": "Personel Ödeme", "Açıklama": f"Ödeme ({j['job_type']})", "Tutar": -j['price_worker']})
+        data.append({"Tarih": j['date'], "Tür": "Personel", "Açıklama": f"Ödeme ({j['job_type']})", "Tutar": -j['price_worker']})
     
     c.execute("SELECT sp.payment_date, sp.amount, p.name, sp.payment_type FROM salary_payments sp JOIN professionals p ON sp.pro_id=p.id")
     for s in c.fetchall(): 
         lbl = "Hafta" if s['payment_type']=='weekly' else "Ay"
         data.append({"Tarih": s['payment_date'], "Tür": "Maaş", "Açıklama": f"{s['name']} ({lbl})", "Tutar": -s['amount']})
-    
-    conn.close()
     
     df_res = pd.DataFrame(data)
     if not df_res.empty:
@@ -197,75 +173,56 @@ def get_financial_report_df():
 if 'wiz_dates' not in st.session_state: st.session_state.wiz_dates = []
 
 # ==========================================
-# ANA UYGULAMA
+# UYGULAMA BAŞLANGICI
 # ==========================================
 with st.sidebar:
-    st.title("📊 Yönetim Paneli")
-    st.write(f"Bugün: **{datetime.now().strftime('%d.%m.%Y')}**")
-    
+    st.title("📊 Yönetim")
+    st.caption(f"Tarih: {datetime.now().strftime('%d.%m.%Y')}")
     st.divider()
-    st.subheader("📅 Kâr/Zarar Analizi")
-    sel_year = st.selectbox("Yıl", [2025, 2026], index=1)
-    sel_month = st.selectbox("Ay", range(1,13), index=datetime.now().month-1)
-    
-    # Seçilen Ayın Analizini Yap
-    m_inc, m_exp = calculate_monthly_profit(sel_month, sel_year)
-    m_net = m_inc - m_exp
-    
+    st.subheader("📅 Kâr Analizi")
+    sel_y = st.selectbox("Yıl", [2025, 2026], index=1)
+    sel_m = st.selectbox("Ay", range(1,13), index=datetime.now().month-1)
+    mi, me = calculate_monthly_profit(sel_m, sel_y)
+    mn = mi - me
     st.markdown(f"""
-    <div style="background-color:#f0f2f6; padding:10px; border-radius:5px;">
-        <h4 style="margin:0; color:#333;">{calendar.month_name[sel_month]} {sel_year}</h4>
-        <hr style="margin:5px 0;">
-        <div style="display:flex; justify-content:space-between;">
-            <span>Gelir:</span><span style="color:green; font-weight:bold;">{m_inc:,.0f} TL</span>
-        </div>
-        <div style="display:flex; justify-content:space-between;">
-            <span>Gider:</span><span style="color:red; font-weight:bold;">{m_exp:,.0f} TL</span>
-        </div>
-        <div style="display:flex; justify-content:space-between; margin-top:5px; border-top:1px solid #ccc; padding-top:5px;">
-            <span>NET:</span><span style="color:{'green' if m_net>=0 else 'red'}; font-weight:bold;">{m_net:,.0f} TL</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
+    <div style="background:#f0f2f6;padding:10px;border-radius:5px;">
+        <h4 style="margin:0;">{calendar.month_name[sel_m]} {sel_y}</h4><hr style="margin:5px 0;">
+        <div style="display:flex;justify-content:space-between;"><span>Gelir:</span><span style="color:green;">{mi:,.0f}</span></div>
+        <div style="display:flex;justify-content:space-between;"><span>Gider:</span><span style="color:red;">{me:,.0f}</span></div>
+        <div style="display:flex;justify-content:space-between;border-top:1px solid #ccc;margin-top:5px;padding-top:5px;"><span>NET:</span><span style="color:{'green' if mn>=0 else 'red'};font-weight:bold;">{mn:,.0f}</span></div>
+    </div>""", unsafe_allow_html=True)
     st.divider()
-    if st.button("Çıkış Yap"): st.session_state.logged_in=False; st.rerun()
-        
+    if st.button("Yenile (F5)"): st.rerun()
+
 st.title("🚀 İşletme Kontrol Merkezi")
 
-# KPI (Kasa ve Borçlar)
-df_report = get_financial_report_df()
-curr_cash = df_report['Tutar'].sum() if not df_report.empty else 0.0
+df_rep = get_financial_report_df()
+curr_cash = df_rep['Tutar'].sum() if not df_rep.empty else 0.0
 
 conn = get_db_connection()
 c = conn.cursor()
 c.execute("SELECT SUM(price_customer) as sum FROM jobs WHERE is_collected=0")
 res = c.fetchone()
 pend_inc = float(res['sum']) if res and res['sum'] else 0.0
-conn.close()
 
-piece_d, sal_d = calculate_obligations()
-tot_debt = piece_d + sal_d
+pd_val, sd_val = calculate_obligations()
+tot_debt = pd_val + sd_val
 
-# Bu Ayın Kârı (Sidebar'da seçili olana göre değil, mevcut aya göre)
-curr_m_inc, curr_m_exp = calculate_monthly_profit(datetime.now().month, datetime.now().year)
-curr_m_net = curr_m_inc - curr_m_exp
+cmi, cme = calculate_monthly_profit(datetime.now().month, datetime.now().year)
+cmn = cmi - cme
 
 k1,k2,k3,k4 = st.columns(4)
-k1.metric("💰 Anlık Kasa", f"{curr_cash:,.2f} TL")
-k2.metric("💳 Alacaklar", f"{pend_inc:,.2f} TL")
-k3.metric("📉 Toplam Borç", f"{tot_debt:,.2f} TL")
-k4.metric(f"📅 Bu Ay Kâr ({datetime.now().strftime('%B')})", f"{curr_m_net:,.2f} TL", delta_color="normal")
+k1.metric("💰 Anlık Kasa", f"{curr_cash:,.0f} TL")
+k2.metric("💳 Alacaklar", f"{pend_inc:,.0f} TL")
+k3.metric("📉 Toplam Borç", f"{tot_debt:,.0f} TL")
+k4.metric(f"📅 Bu Ay Kâr", f"{cmn:,.0f} TL", delta_color="normal")
 
 st.divider()
+tabs = st.tabs(["⚡ İş Planla", "📅 Öğrenci", "📅 Pro", "📂 Profiller", "📈 Finans", "💸 Ödemeler"])
 
-tabs = st.tabs(["⚡ İş Planla", "📅 Öğrenci", "📅 Profesyonel", "📂 Profiller", "📈 Finans", "💸 Ödemeler"])
-
-# --- TAB 1: SİHİRBAZ ---
+# --- TAB 1: SİHİRBAZ (TURBO MODE) ---
 with tabs[0]:
     st.subheader("⚡ Hızlı İş Planlama")
-    conn = get_db_connection()
-    c = conn.cursor()
     c.execute("SELECT * FROM customers")
     custs = c.fetchall()
     c_opts = {c['name']:c['id'] for c in custs}
@@ -274,12 +231,11 @@ with tabs[0]:
         with st.container(border=True):
             c1, c2 = st.columns(2)
             with c1:
-                sel_c = st.selectbox("Müşteri", list(c_opts.keys()), key="wc")
+                sel_c = st.selectbox("Müşteri", list(c_opts.keys()))
                 cid = c_opts[sel_c]
-                pay_m = st.radio("Ödeme Tipi", ["Peşin Alındı", "İş Sonu (Veresiye)"], horizontal=True)
-
+                pay_m = st.radio("Ödeme", ["Peşin", "Veresiye"], horizontal=True)
             with c2:
-                d_mode = st.radio("Tarih Modu", ["Aralık Seç", "Manuel Seç"], horizontal=True)
+                d_mode = st.radio("Tarih", ["Aralık", "Manuel"], horizontal=True)
                 f_dates = []
                 if d_mode.startswith("Aralık"):
                     d1 = st.date_input("Başlangıç"); d2 = st.date_input("Bitiş", value=datetime.now().date()+timedelta(30))
@@ -293,7 +249,7 @@ with tabs[0]:
                 else:
                     cp, cl = st.columns(2)
                     with cp:
-                        pick = st.date_input("Tarih", key="pick")
+                        pick = st.date_input("Tarih")
                         if st.button("Ekle"): 
                             if pick not in st.session_state.wiz_dates: st.session_state.wiz_dates.append(pick)
                     with cl:
@@ -302,23 +258,19 @@ with tabs[0]:
                     f_dates = st.session_state.wiz_dates
 
         st.write("---")
-        pricing_mode = st.radio("💰 Fiyatlandırma", ["Gün Başına Ücret", "Toplam Proje Ücreti"], horizontal=True)
-        
+        p_mode = st.radio("💰 Fiyat Tipi", ["Gün Başına", "Toplam Proje"], horizontal=True)
         c_cost, c_rev = st.columns(2)
         with c_cost:
-            st.info("📉 **Personel**")
             ns = st.number_input("Öğrenci Sayısı", 0, 50, 0)
-            ps = st.number_input("Öğrenciye Ödenecek", 0.0)
+            ps = st.number_input("Öğrenci Ücreti", 0.0)
             np = st.number_input("Pro Sayısı", 0, 50, 0)
-            pp = st.number_input("Proya Ödenecek (Maaşlıysa 0)", 0.0)
-            
+            pp = st.number_input("Pro Ücreti", 0.0)
         with c_rev:
-            st.success(f"📈 **Gelir**")
-            if "Toplam" in pricing_mode:
-                total_project_price = st.number_input("Toplam İş Tutarı", 0.0, step=500.0)
+            if "Toplam" in p_mode:
+                tot_p = st.number_input("Toplam Tutar", 0.0, step=500.0)
             else:
-                daily_price = st.number_input("Günlük Tutar", 0.0, step=500.0)
-                total_project_price = daily_price * len(f_dates)
+                day_p = st.number_input("Günlük Tutar", 0.0, step=500.0)
+                tot_p = day_p * len(f_dates)
 
         if st.button("Oluştur", type="primary"):
             if not f_dates: st.error("Tarih yok.")
@@ -327,73 +279,77 @@ with tabs[0]:
                 is_pre = 1 if pay_m.startswith("Peşin") else 0
                 is_coll = 1 if is_pre else 0
                 
-                cnt = 0
-                first_record_done = False
+                # --- TOPLU INSERT (OPTIMIZATION) ---
+                jobs_to_insert = []
+                first_rec = False
                 
                 for fd in f_dates:
                     ds = fd.strftime("%d.%m.%Y")
-                    
-                    price_for_this_day = 0
-                    if "Toplam" in pricing_mode:
-                        price_for_this_day = total_project_price if not first_record_done else 0
+                    # Fiyat mantığı
+                    if "Toplam" in p_mode:
+                        p_cust = tot_p if not first_rec else 0
                     else:
-                        price_for_this_day = daily_price
+                        p_cust = day_p
                     
-                    # Öğrenci
+                    # Öğrenciler
                     for _ in range(ns):
-                        assigned_customer_price = 0
-                        if "Toplam" in pricing_mode:
-                            if not first_record_done:
-                                assigned_customer_price = total_project_price
-                                first_record_done = True
-                        else:
-                            tot_workers = ns + np
-                            if tot_workers > 0: assigned_customer_price = daily_price / tot_workers
-
-                        c.execute("INSERT INTO jobs (group_id, date, customer_id, job_type, price_worker, price_customer, is_collected, is_prepaid, status) VALUES (%s,%s,%s,%s,%s,%s,%s,%s, 'OPEN')", 
-                                  (gid, ds, cid, 'student', ps, assigned_customer_price, is_coll, is_pre))
-                        cnt+=1
+                        # Günlük/Toplam fiyat sadece günün ilk kaydına veya toplamın ilk kaydına yazılmalı
+                        # Basitlik için: Günlük modda, günün ilk kişisine yazılmalı.
+                        # Burada basit bir bölme yapmıyoruz, mantık karmaşıklaşmasın diye
+                        # Toplam mod: Sadece ilk kayıt. Günlük mod: Her günün ilk kaydı.
                         
-                    # Pro
-                    for _ in range(np):
-                        assigned_customer_price = 0
-                        if "Toplam" in pricing_mode:
-                            if not first_record_done:
-                                assigned_customer_price = total_project_price
-                                first_record_done = True
+                        final_p = 0
+                        if "Toplam" in p_mode:
+                            if not first_rec: final_p = tot_p; first_rec = True
                         else:
-                            tot_workers = ns + np
-                            if tot_workers > 0: assigned_customer_price = daily_price / tot_workers
+                            # Günlük modda bu parayı kime yazacağız? Her günün ilk adamına.
+                            # Bunu döngüde takip etmek zor, basitçe kişiye bölelim daha adil.
+                            if (ns+np) > 0: final_p = day_p / (ns+np)
 
-                        c.execute("INSERT INTO jobs (group_id, date, customer_id, job_type, price_worker, price_customer, is_collected, is_prepaid, status) VALUES (%s,%s,%s,%s,%s,%s,%s,%s, 'OPEN')", 
-                                  (gid, ds, cid, 'pro', pp, assigned_customer_price, is_coll, is_pre))
-                        cnt+=1
+                        jobs_to_insert.append(
+                            (gid, ds, cid, 'student', 'OPEN', None, None, ps, final_p, 0, is_coll, is_pre, None)
+                        )
+                    
+                    # Prolar
+                    for _ in range(np):
+                        final_p = 0
+                        if "Toplam" in p_mode:
+                            if not first_rec: final_p = tot_p; first_rec = True
+                        else:
+                            if (ns+np) > 0: final_p = day_p / (ns+np)
+                            
+                        jobs_to_insert.append(
+                            (gid, ds, cid, 'pro', 'OPEN', None, None, pp, final_p, 0, is_coll, is_pre, None)
+                        )
                 
-                conn.commit()
-                st.success(f"{cnt} iş oluşturuldu. Grup: {gid}")
-                st.session_state.wiz_dates = []
-    else: st.warning("Müşteri ekleyin.")
-    conn.close()
+                # TEK SEFERDE GÖNDER (FAST)
+                if jobs_to_insert:
+                    query = """
+                        INSERT INTO jobs (group_id, date, customer_id, job_type, status, 
+                        assigned_student_id, assigned_pro_id, price_worker, price_customer, 
+                        is_worker_paid, is_collected, is_prepaid, job_note) 
+                        VALUES %s
+                    """
+                    execute_values(c, query, jobs_to_insert)
+                    conn.commit()
+                    st.success(f"{len(jobs_to_insert)} iş hızlıca oluşturuldu! 🚀")
+                    st.session_state.wiz_dates = []
+    else: st.warning("Önce müşteri ekleyin.")
 
-# --- TAKVİM FONKSİYONU ---
+# --- TAKVİM ---
 def render_cal(type_label):
     db_type = 'student' if type_label == 'Öğrenci' else 'pro'
-    conn = get_db_connection()
-    c = conn.cursor()
-    
-    c_cal, c_det = st.columns([2,1])
-    with c_cal:
+    c1, c2 = st.columns([2,1])
+    with c1:
         ny, nm = datetime.now().year, datetime.now().month
-        c_y, c_m = st.columns(2)
-        y = c_y.selectbox(f"Yıl {type_label}", [ny, ny+1], key=f"y{db_type}")
-        m = c_m.selectbox(f"Ay {type_label}", range(1,13), index=nm-1, key=f"m{db_type}")
-        
+        cy, cm = st.columns(2)
+        y = cy.selectbox(f"Yıl {type_label}", [ny, ny+1], key=f"y{db_type}")
+        m = cm.selectbox(f"Ay {type_label}", range(1,13), index=nm-1, key=f"m{db_type}")
         cal = calendar.monthcalendar(y, m)
         m_str = f"{m:02d}.{y}"
         
         c.execute("SELECT j.date, c.name, j.price_customer, j.price_worker FROM jobs j JOIN customers c ON j.customer_id = c.id WHERE j.date LIKE %s AND j.job_type = %s", (f"%{m_str}", db_type))
         jobs_data = c.fetchall()
-        
         day_map = {}
         for row in jobs_data:
             d = row['date']
@@ -403,33 +359,26 @@ def render_cal(type_label):
             day_map[d]['exp'] += row['price_worker']
 
         cols = st.columns(7)
-        for d in ["Pt","Sa","Ça","Pe","Cu","Ct","Pz"]: 
-            cols[list(["Pt","Sa","Ça","Pe","Cu","Ct","Pz"]).index(d)].write(f"**{d}**")
-        
-        for week in cal:
+        for d in ["Pt","Sa","Ça","Pe","Cu","Ct","Pz"]: cols[list(["Pt","Sa","Ça","Pe","Cu","Ct","Pz"]).index(d)].write(f"**{d}**")
+        for w in cal:
             cols = st.columns(7)
-            for i, day in enumerate(week):
+            for i, d in enumerate(w):
                 with cols[i]:
-                    if day != 0:
-                        ds = f"{day:02d}.{m_str}"
+                    if d!=0:
+                        ds = f"{d:02d}.{m_str}"
                         with st.container(border=True):
-                            if st.button(f"**{day}**", key=f"b{db_type}{ds}", use_container_width=True):
-                                st.session_state[f's{db_type}'] = ds
-                            data = day_map.get(ds)
-                            if data:
-                                for name in data['names'][:3]:
-                                    st.markdown(f'<span class="job-badge">{name}</span>', unsafe_allow_html=True)
-                                if len(data['names']) > 3: st.caption("...")
-                                net = data['inc'] - data['exp']
-                                css = "net-profit" if net >= 0 else "net-loss"
-                                st.markdown(f'<div class="{css}">{net:,.0f}</div>', unsafe_allow_html=True)
+                            if st.button(f"**{d}**", key=f"b{db_type}{ds}", use_container_width=True): st.session_state[f's{db_type}'] = ds
+                            dm = day_map.get(ds)
+                            if dm:
+                                for nm in dm['names'][:2]: st.markdown(f'<span class="job-badge">{nm}</span>', unsafe_allow_html=True)
+                                if len(dm['names'])>2: st.caption("...")
+                                net = dm['inc']-dm['exp']
+                                st.markdown(f'<div class="{"net-profit" if net>=0 else "net-loss"}">{net:,.0f}</div>', unsafe_allow_html=True)
                             else: st.markdown("<br>", unsafe_allow_html=True)
-
-    with c_det:
+    with c2:
         sd = st.session_state.get(f's{db_type}', datetime.now().strftime("%d.%m.%Y"))
         st.markdown(f"### 📅 {sd}")
-        
-        with st.expander("📝 Not / Ekstra"):
+        with st.expander("Ekstra"):
             c.execute("SELECT note FROM daily_notes WHERE date=%s", (sd,))
             n = c.fetchone()
             nn = st.text_area("Not", n['note'] if n else "", key=f"n{db_type}")
@@ -437,158 +386,127 @@ def render_cal(type_label):
                 c.execute("INSERT INTO daily_notes (date,note) VALUES (%s,%s) ON CONFLICT(date) DO UPDATE SET note=%s", (sd, nn, nn)); conn.commit(); st.success("ok")
             with st.form(f"q{db_type}"):
                 t = st.selectbox("Tip", ["Gelir", "Gider"])
-                a = st.number_input("Tutar", 0.0); d = st.text_input("Açıklama")
+                a = st.number_input("Tutar", 0.0); desc = st.text_input("Açıklama")
                 if st.form_submit_button("Ekle"):
-                    c.execute("INSERT INTO transactions (date,type,category,amount,description) VALUES (%s,%s,%s,%s,%s)",
-                              (sd, 'income' if t=='Gelir' else 'expense', 'extra', a, d)); conn.commit(); st.rerun()
-
+                    c.execute("INSERT INTO transactions (date,type,category,amount,description) VALUES (%s,%s,%s,%s,%s)",(sd, 'income' if t=='Gelir' else 'expense', 'extra', a, desc)); conn.commit(); st.rerun()
+        
         c.execute("SELECT j.*, c.name, c.location FROM jobs j JOIN customers c ON j.customer_id=c.id WHERE j.date=%s AND j.job_type=%s", (sd, db_type))
         jobs = c.fetchall()
-        
         if jobs:
             for j in jobs:
                 with st.expander(f"📌 {j['name']}"):
                     st.caption(f"📍 {j['location']}")
-                    rev_disp = f"{j['price_customer']} TL" if j['price_customer']>0 else "Proje Dahili"
-                    st.write(f"💵 **Al:** {rev_disp} | **Ver:** {j['price_worker']} TL")
-                    
-                    col1, col2 = st.columns(2)
-                    ic = col1.checkbox("Tahsilat", bool(j['is_collected']), key=f"cc{j['id']}")
-                    iw = col2.checkbox("Ödeme", bool(j['is_worker_paid']), key=f"cw{j['id']}")
-                    
+                    st.write(f"Al: {j['price_customer']} | Ver: {j['price_worker']}")
+                    c_c, c_p = st.columns(2)
+                    ic = c_c.checkbox("Tahsilat", bool(j['is_collected']), key=f"cc{j['id']}")
+                    iw = c_p.checkbox("Ödeme", bool(j['is_worker_paid']), key=f"cw{j['id']}")
                     if ic!=bool(j['is_collected']): c.execute("UPDATE jobs SET is_collected=%s WHERE id=%s", (int(ic), j['id'])); conn.commit(); st.rerun()
                     if iw!=bool(j['is_worker_paid']): c.execute("UPDATE jobs SET is_worker_paid=%s WHERE id=%s", (int(iw), j['id'])); conn.commit(); st.rerun()
                     
-                    assigned = "???"
+                    asg = "???"
                     if j['assigned_student_id']: 
-                        c.execute("SELECT name FROM students WHERE id=%s", (j['assigned_student_id'],))
-                        res = c.fetchone()
-                        if res: assigned = res['name']
+                        c.execute("SELECT name FROM students WHERE id=%s", (j['assigned_student_id'],)); r=c.fetchone()
+                        if r: asg=r['name']
                     elif j['assigned_pro_id']:
-                        c.execute("SELECT name FROM professionals WHERE id=%s", (j['assigned_pro_id'],))
-                        res = c.fetchone()
-                        if res: assigned = res['name']
-                    st.info(f"Personel: {assigned}")
+                        c.execute("SELECT name FROM professionals WHERE id=%s", (j['assigned_pro_id'],)); r=c.fetchone()
+                        if r: asg=r['name']
+                    st.info(f"Personel: {asg}")
                     
                     with st.popover("⚙️ Düzenle"):
                         if db_type=='student':
-                            c.execute("SELECT * FROM students")
-                            opts = {x['name']:x['id'] for x in c.fetchall()}
-                            sel = st.selectbox("Seç", ["-"]+list(opts.keys()), key=f"assign_stu_{j['id']}")
-                            cp = st.number_input("Ücret", value=j['price_worker'], key=f"acp{j['id']}")
-                            if st.button("Kaydet", key=f"ab{j['id']}"):
+                            c.execute("SELECT * FROM students"); opts={x['name']:x['id'] for x in c.fetchall()}
+                            sel=st.selectbox("Seç", ["-"]+list(opts.keys()), key=f"as{j['id']}")
+                            cp=st.number_input("Ücret", value=j['price_worker'], key=f"cp{j['id']}")
+                            if st.button("Kaydet", key=f"sb{j['id']}"):
                                 if sel!="-": c.execute("UPDATE jobs SET assigned_student_id=%s, status='ASSIGNED', price_worker=%s WHERE id=%s",(opts[sel],cp,j['id'])); conn.commit(); st.rerun()
                         else:
-                            c.execute("SELECT * FROM professionals")
-                            opts = {x['name']:x['id'] for x in c.fetchall()}
-                            sel = st.selectbox("Seç", ["-"]+list(opts.keys()), key=f"assign_pro_{j['id']}")
+                            c.execute("SELECT * FROM professionals"); opts={x['name']:x['id'] for x in c.fetchall()}
+                            sel=st.selectbox("Seç", ["-"]+list(opts.keys()), key=f"ap{j['id']}")
                             if sel!="-":
-                                c.execute("SELECT salary, weekly_salary FROM professionals WHERE id=%s", (opts[sel],))
-                                p_d = c.fetchone()
-                                is_sal = (p_d['salary']>0 or p_d['weekly_salary']>0)
-                                np = 0 if is_sal else j['price_worker']
-                                if not is_sal: np = st.number_input("Ücret", value=j['price_worker'] if j['price_worker']>0 else 1500.0, key=f"apnm{j['id']}")
-                                else: st.success("Maaşlı (0 TL)")
-                                if st.button("Kaydet", key=f"apb{j['id']}"):
+                                c.execute("SELECT salary, weekly_salary FROM professionals WHERE id=%s", (opts[sel],)); pd=c.fetchone()
+                                is_sal=(pd['salary']>0 or pd['weekly_salary']>0)
+                                np=0 if is_sal else j['price_worker']
+                                if not is_sal: np=st.number_input("Ücret", value=j['price_worker'], key=f"pnm{j['id']}")
+                                if st.button("Kaydet", key=f"pb{j['id']}"):
                                     c.execute("UPDATE jobs SET assigned_pro_id=%s, status='ASSIGNED', price_worker=%s WHERE id=%s",(opts[sel],np,j['id'])); conn.commit(); st.rerun()
-                    
-                    if st.button("Sil", key=f"dl{j['id']}"): c.execute("DELETE FROM jobs WHERE id=%s", (j['id'],)); conn.commit(); st.rerun()
-        else: st.info("İş yok.")
-    conn.close()
+                    if st.button("🗑️ Sil", key=f"dl{j['id']}"): c.execute("DELETE FROM jobs WHERE id=%s", (j['id'],)); conn.commit(); st.rerun()
+        else: st.info("İş yok")
 
 with tabs[1]: render_cal('Öğrenci')
 with tabs[2]: render_cal('Profesyonel')
 
-# --- TAB 4: PROFILLER ---
+# --- TAB 4: PROFİLLER ---
 with tabs[3]:
-    conn=get_db_connection()
-    c=conn.cursor()
-    t1,t2,t3=st.tabs(["Müşteri","Öğrenci","Pro"])
-    
+    t1,t2,t3 = st.tabs(["Müşteri","Öğrenci","Pro"])
     with t1:
         with st.form("nc"):
             n=st.text_input("Ad"); p=st.text_input("Tel"); l=st.text_input("Konum")
             if st.form_submit_button("Ekle"): c.execute("INSERT INTO customers (name,phone,location) VALUES (%s,%s,%s)",(n,p,l)); conn.commit(); st.rerun()
-        c.execute("SELECT * FROM customers")
-        custs = c.fetchall()
-        sel = st.selectbox("Seç", ["-"]+[x['name'] for x in custs], key="sel_cust_tab")
+        c.execute("SELECT * FROM customers"); cs=c.fetchall()
+        sel = st.selectbox("Seç", ["-"]+[x['name'] for x in cs], key="sct")
         if sel!="-":
-            c.execute("SELECT * FROM customers WHERE name=%s", (sel,))
-            cust = c.fetchone()
+            c.execute("SELECT * FROM customers WHERE name=%s", (sel,)); cu=c.fetchone()
             with st.expander("Düzenle"):
                 with st.form("ec"):
-                    en=st.text_input("Ad",cust['name']); ep=st.text_input("Tel",cust['phone']); el=st.text_input("Konum",cust['location'])
-                    if st.form_submit_button("Güncelle"): c.execute("UPDATE customers SET name=%s, phone=%s, location=%s WHERE id=%s",(en,ep,el,cust['id'])); conn.commit(); st.rerun()
-            st.subheader("Geçmiş")
-            c.execute("SELECT * FROM jobs WHERE customer_id=%s ORDER BY date DESC", (cust['id'],))
-            for j in c.fetchall(): st.write(f"📅 {j['date']} | 💵 {j['price_customer']} TL")
-    
+                    en=st.text_input("Ad",cu['name']); ep=st.text_input("Tel",cu['phone']); el=st.text_input("Yer",cu['location'])
+                    if st.form_submit_button("Güncelle"): c.execute("UPDATE customers SET name=%s, phone=%s, location=%s WHERE id=%s",(en,ep,el,cu['id'])); conn.commit(); st.rerun()
+            st.write("**Geçmiş**")
+            c.execute("SELECT * FROM jobs WHERE customer_id=%s ORDER BY date DESC", (cu['id'],)); js=c.fetchall()
+            for j in js: st.write(f"📅 {j['date']} | 💵 {j['price_customer']}")
     with t2:
         with st.form("ns"):
             n=st.text_input("Ad"); p=st.text_input("Tel")
             if st.form_submit_button("Ekle"): c.execute("INSERT INTO students (name,phone) VALUES (%s,%s)",(n,p)); conn.commit(); st.rerun()
-        c.execute("SELECT * FROM students")
-        stus = c.fetchall()
-        sel = st.selectbox("Seç", ["-"]+[x['name'] for x in stus], key="sel_stu_tab")
+        c.execute("SELECT * FROM students"); ss=c.fetchall()
+        sel = st.selectbox("Seç", ["-"]+[x['name'] for x in ss], key="sst")
         if sel!="-":
-            c.execute("SELECT * FROM students WHERE name=%s", (sel,))
-            stu = c.fetchone()
+            c.execute("SELECT * FROM students WHERE name=%s", (sel,)); s=c.fetchone()
             with st.expander("Düzenle"):
                 with st.form("es"):
-                    en=st.text_input("Ad",stu['name']); ep=st.text_input("Tel",stu['phone'])
-                    if st.form_submit_button("Güncelle"): c.execute("UPDATE students SET name=%s, phone=%s WHERE id=%s",(en,ep,stu['id'])); conn.commit(); st.rerun()
+                    en=st.text_input("Ad",s['name']); ep=st.text_input("Tel",s['phone'])
+                    if st.form_submit_button("Güncelle"): c.execute("UPDATE students SET name=%s, phone=%s WHERE id=%s",(en,ep,s['id'])); conn.commit(); st.rerun()
             st.write("**İşler**")
-            c.execute("SELECT * FROM jobs WHERE assigned_student_id=%s ORDER BY date DESC", (stu['id'],))
-            for j in c.fetchall(): st.write(f"📅 {j['date']} | 💰 {j['price_worker']} TL")
-    
+            c.execute("SELECT * FROM jobs WHERE assigned_student_id=%s ORDER BY date DESC", (s['id'],)); js=c.fetchall()
+            for j in js: st.write(f"📅 {j['date']} | 💰 {j['price_worker']}")
     with t3:
         pt1, pt2 = st.tabs(["Maaşlı", "Ekstra"])
         with pt1:
             with st.form("npm"):
                 n=st.text_input("Ad"); p=st.text_input("Tel"); sa=st.number_input("Ay",0.0); we=st.number_input("Hafta",0.0); da=st.number_input("Gün",1)
                 if st.form_submit_button("Ekle"): c.execute("INSERT INTO professionals (name,phone,salary,weekly_salary,payment_day) VALUES (%s,%s,%s,%s,%s)",(n,p,sa,we,da)); conn.commit(); st.rerun()
-            c.execute("SELECT * FROM professionals WHERE salary>0 OR weekly_salary>0")
-            pros = c.fetchall()
-            sel = st.selectbox("Seç", ["-"]+[x['name'] for x in pros], key="sel_pro_sal_tab")
+            c.execute("SELECT * FROM professionals WHERE salary>0 OR weekly_salary>0"); ps=c.fetchall()
+            sel = st.selectbox("Seç", ["-"]+[x['name'] for x in ps], key="spt1")
             if sel!="-":
-                c.execute("SELECT * FROM professionals WHERE name=%s", (sel,))
-                pro = c.fetchone()
+                c.execute("SELECT * FROM professionals WHERE name=%s", (sel,)); p=c.fetchone()
                 with st.expander("Düzenle"):
                     with st.form("epm"):
-                        en=st.text_input("Ad",pro['name']); es=st.number_input("Ay",pro['salary']); ew=st.number_input("Hafta",pro['weekly_salary']); ed=st.number_input("Gün",pro['payment_day'])
-                        if st.form_submit_button("Güncelle"): c.execute("UPDATE professionals SET name=%s, salary=%s, weekly_salary=%s, payment_day=%s WHERE id=%s",(en,es,ew,ed,pro['id'])); conn.commit(); st.rerun()
+                        en=st.text_input("Ad",p['name']); es=st.number_input("Ay",p['salary']); ew=st.number_input("Hafta",p['weekly_salary']); ed=st.number_input("Gün",p['payment_day'])
+                        if st.form_submit_button("Güncelle"): c.execute("UPDATE professionals SET name=%s, salary=%s, weekly_salary=%s, payment_day=%s WHERE id=%s",(en,es,ew,ed,p['id'])); conn.commit(); st.rerun()
                 st.write("**İşler**")
-                c.execute("SELECT * FROM jobs WHERE assigned_pro_id=%s ORDER BY date DESC", (pro['id'],))
-                for j in c.fetchall(): st.write(f"📅 {j['date']}") 
-
+                c.execute("SELECT * FROM jobs WHERE assigned_pro_id=%s ORDER BY date DESC", (p['id'],)); js=c.fetchall()
+                for j in js: st.write(f"📅 {j['date']}")
         with pt2:
             with st.form("npe"):
                 n=st.text_input("Ad"); p=st.text_input("Tel")
                 if st.form_submit_button("Ekle"): c.execute("INSERT INTO professionals (name,phone,salary,weekly_salary,payment_day) VALUES (%s,%s,%s,%s,%s)",(n,p,0,0,1)); conn.commit(); st.rerun()
-            c.execute("SELECT * FROM professionals WHERE salary=0 AND weekly_salary=0")
-            epros = c.fetchall()
-            sel = st.selectbox("Seç", ["-"]+[x['name'] for x in epros], key="sel_pro_ext_tab")
+            c.execute("SELECT * FROM professionals WHERE salary=0 AND weekly_salary=0"); eps=c.fetchall()
+            sel = st.selectbox("Seç", ["-"]+[x['name'] for x in eps], key="spt2")
             if sel!="-":
-                c.execute("SELECT * FROM professionals WHERE name=%s", (sel,))
-                pro = c.fetchone()
+                c.execute("SELECT * FROM professionals WHERE name=%s", (sel,)); p=c.fetchone()
                 with st.expander("Düzenle"):
                     with st.form("epe"):
-                        en=st.text_input("Ad",pro['name']); ep=st.text_input("Tel",pro['phone'])
-                        if st.form_submit_button("Güncelle"): c.execute("UPDATE professionals SET name=%s, phone=%s WHERE id=%s",(en,ep,pro['id'])); conn.commit(); st.rerun()
+                        en=st.text_input("Ad",p['name']); ep=st.text_input("Tel",p['phone'])
+                        if st.form_submit_button("Güncelle"): c.execute("UPDATE professionals SET name=%s, phone=%s WHERE id=%s",(en,ep,p['id'])); conn.commit(); st.rerun()
                 st.write("**İşler**")
-                c.execute("SELECT * FROM jobs WHERE assigned_pro_id=%s ORDER BY date DESC", (pro['id'],))
-                for j in c.fetchall(): st.write(f"📅 {j['date']} | 💰 {j['price_worker']} TL")
-    conn.close()
+                c.execute("SELECT * FROM jobs WHERE assigned_pro_id=%s ORDER BY date DESC", (p['id'],)); js=c.fetchall()
+                for j in js: st.write(f"📅 {j['date']} | 💰 {j['price_worker']}")
 
 with tabs[4]:
     df = get_financial_report_df()
     st.dataframe(df, width="stretch")
-    if not df.empty:
-        st.download_button("İndir", df.to_csv(index=False).encode('utf-8'), "finans.csv", "text/csv")
+    if not df.empty: st.download_button("İndir", df.to_csv(index=False).encode('utf-8'), "finans.csv", "text/csv")
 
 with tabs[5]:
-    conn = get_db_connection()
-    c = conn.cursor()
     p1,p2,p3 = st.tabs(["Aylık","Haftalık","Parça"])
     with p1:
         cm = f"{datetime.now().month:02d}-{datetime.now().year}"
@@ -623,4 +541,5 @@ with tabs[5]:
                 if c2.button("Öde", key=f"pj{u['id']}"):
                     c.execute("UPDATE jobs SET is_worker_paid=1 WHERE id=%s",(u['id'],)); conn.commit(); st.rerun()
         else: st.info("Borç yok")
-    conn.close()
+
+# ÖNEMLİ: Kapanış yapmıyoruz, cache korunuyor.
