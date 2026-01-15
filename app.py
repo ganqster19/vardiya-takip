@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timedelta, date
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="Vardiya ERP Ultimate", page_icon="📆", layout="wide")
+st.set_page_config(page_title="Vardiya ERP Ultimate", page_icon="📈", layout="wide")
 
 # CSS (Görsel Düzenlemeler)
 st.markdown("""
@@ -49,7 +49,7 @@ def init_db():
     conn = get_db_connection()
     c = conn.cursor()
     
-    # Tablolar (SERIAL ID ile)
+    # Tablolar
     c.execute('''CREATE TABLE IF NOT EXISTS customers (id SERIAL PRIMARY KEY, name TEXT, phone TEXT, location TEXT, default_note TEXT, is_regular INTEGER DEFAULT 0, frequency TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS students (id SERIAL PRIMARY KEY, name TEXT, phone TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS cash_inflow (id SERIAL PRIMARY KEY, group_id TEXT, date TEXT, amount REAL, description TEXT, customer_id INTEGER)''')
@@ -69,7 +69,7 @@ def init_db():
 
 init_db()
 
-# --- FİNANSAL MOTOR ---
+# --- FİNANSAL MOTOR (BORÇ HESABI) ---
 def calculate_obligations():
     conn = get_db_connection()
     c = conn.cursor()
@@ -85,6 +85,8 @@ def calculate_obligations():
     
     next_month = today.replace(day=28) + timedelta(days=4)
     last_day = next_month - timedelta(days=next_month.day)
+    first_day = today.replace(day=1)
+    
     curr_month_key = f"{today.month:02d}-{today.year}"
     
     for p in pros:
@@ -92,7 +94,7 @@ def calculate_obligations():
             c.execute("SELECT id FROM salary_payments WHERE pro_id=%s AND month_year=%s AND payment_type='monthly'", (p['id'], curr_month_key))
             if not c.fetchone(): salary_debt_val += p['salary']
         if p['weekly_salary'] > 0:
-            tmp = today
+            tmp = first_day
             while tmp <= last_day:
                 if tmp.weekday() == 0:
                     wk = f"W{tmp.isocalendar()[1]}-{tmp.year}"
@@ -102,6 +104,63 @@ def calculate_obligations():
                 
     conn.close()
     return piece_debt_val, salary_debt_val
+
+# --- YENİ: AYLIK KÂR/ZARAR MOTORU ---
+def calculate_monthly_profit(month, year):
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    # Tarih formatı: %.MM.YYYY (SQL Like sorgusu için)
+    date_pattern = f"%.{month:02d}.{year}"
+    
+    # 1. İŞ GELİRLERİ (Tahakkuk Eden - Yani o ay yapılmış tüm işlerin geliri)
+    c.execute("SELECT SUM(price_customer) FROM jobs WHERE date LIKE %s", (date_pattern,))
+    res = c.fetchone()
+    total_income_jobs = float(res['sum']) if res and res['sum'] else 0.0
+    
+    # 2. İŞ GİDERLERİ (Parça Başı Personel)
+    c.execute("SELECT SUM(price_worker) FROM jobs WHERE date LIKE %s", (date_pattern,))
+    res = c.fetchone()
+    total_expense_jobs = float(res['sum']) if res and res['sum'] else 0.0
+    
+    # 3. EKSTRA GELİRLER (Transactions)
+    c.execute("SELECT SUM(amount) FROM transactions WHERE type='income' AND date LIKE %s", (date_pattern,))
+    res = c.fetchone()
+    total_income_extra = float(res['sum']) if res and res['sum'] else 0.0
+    
+    # 4. EKSTRA GİDERLER (Transactions + Expenses Tablosu varsa)
+    c.execute("SELECT SUM(amount) FROM transactions WHERE type='expense' AND date LIKE %s", (date_pattern,))
+    res = c.fetchone()
+    total_expense_extra = float(res['sum']) if res and res['sum'] else 0.0
+    
+    # 5. MAAŞ GİDERLERİ (SABİT)
+    c.execute("SELECT salary, weekly_salary FROM professionals")
+    pros = c.fetchall()
+    
+    total_salary_monthly = 0
+    total_salary_weekly = 0
+    
+    # O aydaki Pazartesi sayısını bul
+    num_days = calendar.monthrange(year, month)[1]
+    mondays_count = 0
+    for day in range(1, num_days + 1):
+        if date(year, month, day).weekday() == 0:
+            mondays_count += 1
+            
+    for p in pros:
+        # Aylık Maaş (Her ay 1 kere gider yazılır)
+        if p['salary'] > 0:
+            total_salary_monthly += p['salary']
+        # Haftalık Maaş (O aydaki pazartesi sayısı kadar gider yazılır)
+        if p['weekly_salary'] > 0:
+            total_salary_weekly += (p['weekly_salary'] * mondays_count)
+            
+    conn.close()
+    
+    total_income = total_income_jobs + total_income_extra
+    total_expense = total_expense_jobs + total_expense_extra + total_salary_monthly + total_salary_weekly
+    
+    return total_income, total_expense
 
 def get_financial_report_df():
     conn = get_db_connection()
@@ -138,15 +197,43 @@ def get_financial_report_df():
 if 'wiz_dates' not in st.session_state: st.session_state.wiz_dates = []
 
 # ==========================================
-# ANA UYGULAMA (GİRİŞ EKRANI KALDIRILDI)
+# ANA UYGULAMA
 # ==========================================
 with st.sidebar:
-    st.write("📊 **Vardiya Paneli**")
-    st.caption(f"Tarih: {datetime.now().strftime('%d.%m.%Y')}")
+    st.title("📊 Yönetim Paneli")
+    st.write(f"Bugün: **{datetime.now().strftime('%d.%m.%Y')}**")
+    
+    st.divider()
+    st.subheader("📅 Kâr/Zarar Analizi")
+    sel_year = st.selectbox("Yıl", [2025, 2026], index=1)
+    sel_month = st.selectbox("Ay", range(1,13), index=datetime.now().month-1)
+    
+    # Seçilen Ayın Analizini Yap
+    m_inc, m_exp = calculate_monthly_profit(sel_month, sel_year)
+    m_net = m_inc - m_exp
+    
+    st.markdown(f"""
+    <div style="background-color:#f0f2f6; padding:10px; border-radius:5px;">
+        <h4 style="margin:0; color:#333;">{calendar.month_name[sel_month]} {sel_year}</h4>
+        <hr style="margin:5px 0;">
+        <div style="display:flex; justify-content:space-between;">
+            <span>Gelir:</span><span style="color:green; font-weight:bold;">{m_inc:,.0f} TL</span>
+        </div>
+        <div style="display:flex; justify-content:space-between;">
+            <span>Gider:</span><span style="color:red; font-weight:bold;">{m_exp:,.0f} TL</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; margin-top:5px; border-top:1px solid #ccc; padding-top:5px;">
+            <span>NET:</span><span style="color:{'green' if m_net>=0 else 'red'}; font-weight:bold;">{m_net:,.0f} TL</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.divider()
+    if st.button("Çıkış Yap"): st.session_state.logged_in=False; st.rerun()
         
-st.title("📊 Operasyonel Kontrol Paneli")
+st.title("🚀 İşletme Kontrol Merkezi")
 
-# KPI
+# KPI (Kasa ve Borçlar)
 df_report = get_financial_report_df()
 curr_cash = df_report['Tutar'].sum() if not df_report.empty else 0.0
 
@@ -160,11 +247,15 @@ conn.close()
 piece_d, sal_d = calculate_obligations()
 tot_debt = piece_d + sal_d
 
+# Bu Ayın Kârı (Sidebar'da seçili olana göre değil, mevcut aya göre)
+curr_m_inc, curr_m_exp = calculate_monthly_profit(datetime.now().month, datetime.now().year)
+curr_m_net = curr_m_inc - curr_m_exp
+
 k1,k2,k3,k4 = st.columns(4)
 k1.metric("💰 Anlık Kasa", f"{curr_cash:,.2f} TL")
 k2.metric("💳 Alacaklar", f"{pend_inc:,.2f} TL")
-k3.metric("📉 Gelecek Borç", f"{tot_debt:,.2f} TL", help="Parça Başı + Maaşlar")
-k4.metric("🔮 Net Tahmin", f"{(curr_cash + pend_inc - tot_debt):,.2f} TL")
+k3.metric("📉 Toplam Borç", f"{tot_debt:,.2f} TL")
+k4.metric(f"📅 Bu Ay Kâr ({datetime.now().strftime('%B')})", f"{curr_m_net:,.2f} TL", delta_color="normal")
 
 st.divider()
 
@@ -358,7 +449,8 @@ def render_cal(type_label):
             for j in jobs:
                 with st.expander(f"📌 {j['name']}"):
                     st.caption(f"📍 {j['location']}")
-                    st.write(f"💵 **Al:** {j['price_customer']} | **Ver:** {j['price_worker']}")
+                    rev_disp = f"{j['price_customer']} TL" if j['price_customer']>0 else "Proje Dahili"
+                    st.write(f"💵 **Al:** {rev_disp} | **Ver:** {j['price_worker']} TL")
                     
                     col1, col2 = st.columns(2)
                     ic = col1.checkbox("Tahsilat", bool(j['is_collected']), key=f"cc{j['id']}")
@@ -382,7 +474,6 @@ def render_cal(type_label):
                         if db_type=='student':
                             c.execute("SELECT * FROM students")
                             opts = {x['name']:x['id'] for x in c.fetchall()}
-                            # FIX: KEY ERROR ÇÖZÜLDÜ
                             sel = st.selectbox("Seç", ["-"]+list(opts.keys()), key=f"assign_stu_{j['id']}")
                             cp = st.number_input("Ücret", value=j['price_worker'], key=f"acp{j['id']}")
                             if st.button("Kaydet", key=f"ab{j['id']}"):
@@ -390,7 +481,6 @@ def render_cal(type_label):
                         else:
                             c.execute("SELECT * FROM professionals")
                             opts = {x['name']:x['id'] for x in c.fetchall()}
-                            # FIX: KEY ERROR ÇÖZÜLDÜ
                             sel = st.selectbox("Seç", ["-"]+list(opts.keys()), key=f"assign_pro_{j['id']}")
                             if sel!="-":
                                 c.execute("SELECT salary, weekly_salary FROM professionals WHERE id=%s", (opts[sel],))
@@ -421,7 +511,6 @@ with tabs[3]:
             if st.form_submit_button("Ekle"): c.execute("INSERT INTO customers (name,phone,location) VALUES (%s,%s,%s)",(n,p,l)); conn.commit(); st.rerun()
         c.execute("SELECT * FROM customers")
         custs = c.fetchall()
-        # FIX: KEY ERROR ÇÖZÜLDÜ
         sel = st.selectbox("Seç", ["-"]+[x['name'] for x in custs], key="sel_cust_tab")
         if sel!="-":
             c.execute("SELECT * FROM customers WHERE name=%s", (sel,))
@@ -440,7 +529,6 @@ with tabs[3]:
             if st.form_submit_button("Ekle"): c.execute("INSERT INTO students (name,phone) VALUES (%s,%s)",(n,p)); conn.commit(); st.rerun()
         c.execute("SELECT * FROM students")
         stus = c.fetchall()
-        # FIX: KEY ERROR ÇÖZÜLDÜ
         sel = st.selectbox("Seç", ["-"]+[x['name'] for x in stus], key="sel_stu_tab")
         if sel!="-":
             c.execute("SELECT * FROM students WHERE name=%s", (sel,))
@@ -461,7 +549,6 @@ with tabs[3]:
                 if st.form_submit_button("Ekle"): c.execute("INSERT INTO professionals (name,phone,salary,weekly_salary,payment_day) VALUES (%s,%s,%s,%s,%s)",(n,p,sa,we,da)); conn.commit(); st.rerun()
             c.execute("SELECT * FROM professionals WHERE salary>0 OR weekly_salary>0")
             pros = c.fetchall()
-            # FIX: KEY ERROR ÇÖZÜLDÜ
             sel = st.selectbox("Seç", ["-"]+[x['name'] for x in pros], key="sel_pro_sal_tab")
             if sel!="-":
                 c.execute("SELECT * FROM professionals WHERE name=%s", (sel,))
@@ -480,7 +567,6 @@ with tabs[3]:
                 if st.form_submit_button("Ekle"): c.execute("INSERT INTO professionals (name,phone,salary,weekly_salary,payment_day) VALUES (%s,%s,%s,%s,%s)",(n,p,0,0,1)); conn.commit(); st.rerun()
             c.execute("SELECT * FROM professionals WHERE salary=0 AND weekly_salary=0")
             epros = c.fetchall()
-            # FIX: KEY ERROR ÇÖZÜLDÜ
             sel = st.selectbox("Seç", ["-"]+[x['name'] for x in epros], key="sel_pro_ext_tab")
             if sel!="-":
                 c.execute("SELECT * FROM professionals WHERE name=%s", (sel,))
