@@ -1,13 +1,13 @@
 import streamlit as st
 import pandas as pd
 import psycopg2
-from psycopg2.extras import RealDictCursor, execute_values
+from psycopg2.extras import RealDictCursor, execute_values  # execute_values eklendi
 import calendar
 import uuid
 from datetime import datetime, timedelta, date
 
 # --- SAYFA AYARLARI ---
-st.set_page_config(page_title="Vardiya ERP Ultimate", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="Vardiya ERP Ultimate", page_icon="⚡", layout="wide")
 
 # CSS (Görsel Düzenlemeler)
 st.markdown("""
@@ -23,7 +23,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- VERİTABANI BAĞLANTISI (CACHED) ---
+# --- VERİTABANI BAĞLANTISI (CACHED / ÖNBELLEKLİ) ---
+# Bu kısım bağlantıyı hafızada tutar, her işlemde tekrar bağlanmaz.
 @st.cache_resource
 def get_db_connection():
     try:
@@ -50,7 +51,7 @@ def init_db():
     conn = get_db_connection()
     c = conn.cursor()
     
-    # Tablolar (Admin tablosu kaldırıldı)
+    # Tablolar
     c.execute('''CREATE TABLE IF NOT EXISTS customers (id SERIAL PRIMARY KEY, name TEXT, phone TEXT, location TEXT, default_note TEXT, is_regular INTEGER DEFAULT 0, frequency TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS students (id SERIAL PRIMARY KEY, name TEXT, phone TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS cash_inflow (id SERIAL PRIMARY KEY, group_id TEXT, date TEXT, amount REAL, description TEXT, customer_id INTEGER)''')
@@ -66,7 +67,7 @@ def init_db():
     add_column_safe(c, "salary_payments", "payment_type", "TEXT DEFAULT 'monthly'")
     
     conn.commit()
-    # Bağlantıyı kapatmıyoruz, cache kullanıyoruz.
+    # conn.close()  <-- KAPATMIYORUZ! Cache bozulur.
 
 init_db()
 
@@ -84,9 +85,10 @@ def calculate_obligations():
     c.execute("SELECT id, salary, weekly_salary FROM professionals")
     pros = c.fetchall()
     
-    first_day = today.replace(day=1)
     next_month = today.replace(day=28) + timedelta(days=4)
     last_day = next_month - timedelta(days=next_month.day)
+    first_day = today.replace(day=1)
+    
     curr_month_key = f"{today.month:02d}-{today.year}"
     
     for p in pros:
@@ -171,11 +173,8 @@ def get_financial_report_df():
 if 'wiz_dates' not in st.session_state: st.session_state.wiz_dates = []
 
 # ==========================================
-# ANA UYGULAMA (DİREKT BAŞLANGIÇ)
+# UYGULAMA BAŞLANGICI
 # ==========================================
-conn = get_db_connection()
-c = conn.cursor()
-
 with st.sidebar:
     st.title("📊 Yönetim")
     st.caption(f"Tarih: {datetime.now().strftime('%d.%m.%Y')}")
@@ -200,6 +199,8 @@ st.title("🚀 İşletme Kontrol Merkezi")
 df_rep = get_financial_report_df()
 curr_cash = df_rep['Tutar'].sum() if not df_rep.empty else 0.0
 
+conn = get_db_connection()
+c = conn.cursor()
 c.execute("SELECT SUM(price_customer) as sum FROM jobs WHERE is_collected=0")
 res = c.fetchone()
 pend_inc = float(res['sum']) if res and res['sum'] else 0.0
@@ -292,10 +293,17 @@ with tabs[0]:
                     
                     # Öğrenciler
                     for _ in range(ns):
+                        # Günlük/Toplam fiyat sadece günün ilk kaydına veya toplamın ilk kaydına yazılmalı
+                        # Basitlik için: Günlük modda, günün ilk kişisine yazılmalı.
+                        # Burada basit bir bölme yapmıyoruz, mantık karmaşıklaşmasın diye
+                        # Toplam mod: Sadece ilk kayıt. Günlük mod: Her günün ilk kaydı.
+                        
                         final_p = 0
                         if "Toplam" in p_mode:
                             if not first_rec: final_p = tot_p; first_rec = True
                         else:
+                            # Günlük modda bu parayı kime yazacağız? Her günün ilk adamına.
+                            # Bunu döngüde takip etmek zor, basitçe kişiye bölelim daha adil.
                             if (ns+np) > 0: final_p = day_p / (ns+np)
 
                         jobs_to_insert.append(
@@ -314,6 +322,7 @@ with tabs[0]:
                             (gid, ds, cid, 'pro', 'OPEN', None, None, pp, final_p, 0, is_coll, is_pre, None)
                         )
                 
+                # TEK SEFERDE GÖNDER (FAST)
                 if jobs_to_insert:
                     query = """
                         INSERT INTO jobs (group_id, date, customer_id, job_type, status, 
@@ -532,3 +541,5 @@ with tabs[5]:
                 if c2.button("Öde", key=f"pj{u['id']}"):
                     c.execute("UPDATE jobs SET is_worker_paid=1 WHERE id=%s",(u['id'],)); conn.commit(); st.rerun()
         else: st.info("Borç yok")
+
+# ÖNEMLİ: Kapanış yapmıyoruz, cache korunuyor.
