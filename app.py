@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 import calendar
 import uuid
 from datetime import datetime, timedelta, date
@@ -41,21 +41,17 @@ def get_db_connection():
         st.error(f"Veritabanı Hatası: {e}")
         st.stop()
 
-# --- GÜVENLİ MİGRASYON FONKSİYONU ---
-def add_column_safe(conn, table, column, type_def):
+def add_column_safe(cursor, table, column, type_def):
     try:
-        with conn.cursor() as c:
-            c.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {type_def}")
-            conn.commit()
-    except psycopg2.Error:
-        conn.rollback() # Hata olursa işlemi geri al ki bağlantı kilitlenmesin
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {type_def}")
+    except psycopg2.Error: pass
 
-# --- VERİTABANI BAŞLATMA (HATA KORUMALI) ---
 def init_db():
     conn = get_db_connection()
     
-    # KRİTİK: Önceki hataları temizle (Rollback)
-    conn.rollback()
+    # --- KRİTİK DÜZELTME: KİLİDİ AÇ ---
+    conn.rollback() 
+    # ----------------------------------
     
     c = conn.cursor()
     
@@ -70,19 +66,21 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS professionals (id SERIAL PRIMARY KEY, name TEXT, phone TEXT, salary REAL DEFAULT 0, payment_day INTEGER DEFAULT 1)''')
     c.execute('''CREATE TABLE IF NOT EXISTS salary_payments (id SERIAL PRIMARY KEY, pro_id INTEGER, amount REAL, payment_date TEXT, month_year TEXT, payment_type TEXT DEFAULT 'monthly')''')
     c.execute('''CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, date TEXT, type TEXT, category TEXT, amount REAL, description TEXT, related_id INTEGER)''')
-    
-    conn.commit()
 
-    # Eksik sütunları güvenli ekle
-    add_column_safe(conn, "professionals", "weekly_salary", "REAL DEFAULT 0")
-    add_column_safe(conn, "salary_payments", "payment_type", "TEXT DEFAULT 'monthly'")
+    add_column_safe(c, "professionals", "weekly_salary", "REAL DEFAULT 0")
+    add_column_safe(c, "salary_payments", "payment_type", "TEXT DEFAULT 'monthly'")
     
-    # Yeni eklediğimiz sütunlar (Hata vermemesi için IF NOT EXISTS mantığıyla)
-    add_column_safe(conn, "customers", "district", "TEXT")
-    add_column_safe(conn, "customers", "segment", "TEXT DEFAULT 'Yeni'")
-    add_column_safe(conn, "jobs", "status", "TEXT DEFAULT 'CONFIRMED'")
-    add_column_safe(conn, "jobs", "rejection_reason", "TEXT")
-    add_column_safe(conn, "jobs", "service_type", "TEXT DEFAULT 'Standart'")
+    # Bu sütunlar veritabanında varsa hata vermez, yoksa ekler (Hata koruması için try-except içinde değil, rollback sonrası temiz çalışır)
+    try:
+        c.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS district TEXT")
+        c.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS segment TEXT DEFAULT 'Yeni'")
+        c.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'CONFIRMED'")
+        c.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS rejection_reason TEXT")
+        c.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS service_type TEXT DEFAULT 'Standart'")
+    except psycopg2.Error:
+        conn.rollback() # Sütun zaten varsa ve hata verirse yine temizle
+
+    conn.commit()
 
 init_db()
 
@@ -189,8 +187,11 @@ if 'wiz_dates' not in st.session_state: st.session_state.wiz_dates = []
 # ==========================================
 # ANA UYGULAMA
 # ==========================================
-conn = get_db_connection()
-conn.rollback() # Başlangıçta olası kilitlenmeleri aç
+# Uygulama her başladığında bir kez rollback yapalım ki temiz başlasın
+try:
+    conn = get_db_connection()
+    conn.rollback()
+except: pass
 
 with st.sidebar:
     st.title("📊 Yönetim")
@@ -348,6 +349,7 @@ with tabs[0]:
                     st.success(f"{len(jobs_to_insert)} iş hızlıca oluşturuldu! 🚀")
                     st.session_state.wiz_dates = []
     else: st.warning("Önce müşteri ekleyin.")
+    conn.close()
 
 # --- TAKVİM ---
 def render_cal(type_label):
@@ -446,6 +448,7 @@ def render_cal(type_label):
                                     c.execute("UPDATE jobs SET assigned_pro_id=%s, status='ASSIGNED', price_worker=%s WHERE id=%s",(opts[sel],np,j['id'])); conn.commit(); st.rerun()
                     if st.button("🗑️ Sil", key=f"dl{j['id']}"): c.execute("DELETE FROM jobs WHERE id=%s", (j['id'],)); conn.commit(); st.rerun()
         else: st.info("İş yok")
+    conn.close()
 
 with tabs[1]: render_cal('Öğrenci')
 with tabs[2]: render_cal('Profesyonel')
@@ -517,6 +520,7 @@ with tabs[3]:
                 st.write("**İşler**")
                 c.execute("SELECT * FROM jobs WHERE assigned_pro_id=%s ORDER BY date DESC", (p['id'],)); js=c.fetchall()
                 for j in js: st.write(f"📅 {j['date']} | 💰 {j['price_worker']}")
+    conn.close()
 
 with tabs[4]:
     df = get_financial_report_df()
@@ -560,3 +564,4 @@ with tabs[5]:
                 if c2.button("Öde", key=f"pj{u['id']}"):
                     c.execute("UPDATE jobs SET is_worker_paid=1 WHERE id=%s",(u['id'],)); conn.commit(); st.rerun()
         else: st.info("Borç yok")
+    conn.close()
