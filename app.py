@@ -24,6 +24,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- VERİTABANI BAĞLANTISI ---
+# --- VERİTABANI BAĞLANTISI (ZAMAN AŞIMI AYARLI) ---
 @st.cache_resource
 def get_db_connection():
     try:
@@ -34,11 +35,12 @@ def get_db_connection():
             password=st.secrets["supabase"]["password"],
             port=st.secrets["supabase"]["port"],
             cursor_factory=RealDictCursor,
-            sslmode='require'
+            sslmode='require',
+            connect_timeout=10  # <-- EKLE: 10 saniye içinde bağlanamazsa hata verip dursun, beklemesin.
         )
         return conn
     except Exception as e:
-        st.error(f"Veritabanı Hatası: {e}")
+        st.error(f"Veritabanı Bağlantı Hatası: {e}")
         st.stop()
 
 def add_column_safe(cursor, table, column, type_def):
@@ -565,3 +567,4 @@ with tabs[5]:
                     c.execute("UPDATE jobs SET is_worker_paid=1 WHERE id=%s",(u['id'],)); conn.commit(); st.rerun()
         else: st.info("Borç yok")
     conn.close()
+
