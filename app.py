@@ -23,8 +23,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- VERİTABANI BAĞLANTISI ---
-# --- VERİTABANI BAĞLANTISI (ZAMAN AŞIMI AYARLI) ---
+# --- VERİTABANI BAĞLANTISI (ZAMAN AŞIMI KORUMALI) ---
 @st.cache_resource
 def get_db_connection():
     try:
@@ -36,11 +35,17 @@ def get_db_connection():
             port=st.secrets["supabase"]["port"],
             cursor_factory=RealDictCursor,
             sslmode='require',
-            connect_timeout=10  # <-- EKLE: 10 saniye içinde bağlanamazsa hata verip dursun, beklemesin.
+            connect_timeout=10,  # <-- 10 saniye içinde bağlanamazsa hata verip durur
+            keepalives=1,
+            keepalives_idle=5,
+            keepalives_interval=2,
+            keepalives_count=2
         )
         return conn
     except Exception as e:
-        st.error(f"Veritabanı Bağlantı Hatası: {e}")
+        # Hata mesajını ekrana basıp durduruyoruz
+        st.error(f"🔴 Veritabanı Bağlantı Hatası: {e}")
+        st.info("İPUCU: Streamlit Secrets ayarlarında PORT'un 6543 (Pooler) olduğundan emin olun.")
         st.stop()
 
 def add_column_safe(cursor, table, column, type_def):
@@ -49,41 +54,36 @@ def add_column_safe(cursor, table, column, type_def):
     except psycopg2.Error: pass
 
 def init_db():
-    conn = get_db_connection()
-    
-    # --- KRİTİK DÜZELTME: KİLİDİ AÇ ---
-    conn.rollback() 
-    # ----------------------------------
-    
-    c = conn.cursor()
-    
-    # Tablolar
-    c.execute('''CREATE TABLE IF NOT EXISTS customers (id SERIAL PRIMARY KEY, name TEXT, phone TEXT, location TEXT, default_note TEXT, is_regular INTEGER DEFAULT 0, frequency TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS students (id SERIAL PRIMARY KEY, name TEXT, phone TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS cash_inflow (id SERIAL PRIMARY KEY, group_id TEXT, date TEXT, amount REAL, description TEXT, customer_id INTEGER)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS jobs (id SERIAL PRIMARY KEY, group_id TEXT, date TEXT, customer_id INTEGER, job_type TEXT DEFAULT 'student', status TEXT DEFAULT 'OPEN', assigned_student_id INTEGER, assigned_pro_id INTEGER, price_worker REAL DEFAULT 0, price_customer REAL DEFAULT 0, is_worker_paid INTEGER DEFAULT 0, is_collected INTEGER DEFAULT 0, is_prepaid INTEGER DEFAULT 0, job_note TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS availability (user_phone TEXT, date TEXT, is_available INTEGER, UNIQUE(user_phone, date))''')
-    c.execute('''CREATE TABLE IF NOT EXISTS expenses (id SERIAL PRIMARY KEY, date TEXT, description TEXT, amount REAL)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS daily_notes (date TEXT PRIMARY KEY, note TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS professionals (id SERIAL PRIMARY KEY, name TEXT, phone TEXT, salary REAL DEFAULT 0, payment_day INTEGER DEFAULT 1)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS salary_payments (id SERIAL PRIMARY KEY, pro_id INTEGER, amount REAL, payment_date TEXT, month_year TEXT, payment_type TEXT DEFAULT 'monthly')''')
-    c.execute('''CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, date TEXT, type TEXT, category TEXT, amount REAL, description TEXT, related_id INTEGER)''')
+    # Ekrana bilgi veriyoruz
+    with st.spinner("Veritabanı başlatılıyor..."):
+        conn = get_db_connection()
+        
+        # Olası kilitlenmeleri çöz
+        conn.rollback()
+        
+        c = conn.cursor()
+        
+        # Tablolar
+        c.execute('''CREATE TABLE IF NOT EXISTS customers (id SERIAL PRIMARY KEY, name TEXT, phone TEXT, location TEXT, default_note TEXT, is_regular INTEGER DEFAULT 0, frequency TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS students (id SERIAL PRIMARY KEY, name TEXT, phone TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS cash_inflow (id SERIAL PRIMARY KEY, group_id TEXT, date TEXT, amount REAL, description TEXT, customer_id INTEGER)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS jobs (id SERIAL PRIMARY KEY, group_id TEXT, date TEXT, customer_id INTEGER, job_type TEXT DEFAULT 'student', status TEXT DEFAULT 'OPEN', assigned_student_id INTEGER, assigned_pro_id INTEGER, price_worker REAL DEFAULT 0, price_customer REAL DEFAULT 0, is_worker_paid INTEGER DEFAULT 0, is_collected INTEGER DEFAULT 0, is_prepaid INTEGER DEFAULT 0, job_note TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS availability (user_phone TEXT, date TEXT, is_available INTEGER, UNIQUE(user_phone, date))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS expenses (id SERIAL PRIMARY KEY, date TEXT, description TEXT, amount REAL)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS daily_notes (date TEXT PRIMARY KEY, note TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS professionals (id SERIAL PRIMARY KEY, name TEXT, phone TEXT, salary REAL DEFAULT 0, payment_day INTEGER DEFAULT 1)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS salary_payments (id SERIAL PRIMARY KEY, pro_id INTEGER, amount REAL, payment_date TEXT, month_year TEXT, payment_type TEXT DEFAULT 'monthly')''')
+        c.execute('''CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, date TEXT, type TEXT, category TEXT, amount REAL, description TEXT, related_id INTEGER)''')
 
-    add_column_safe(c, "professionals", "weekly_salary", "REAL DEFAULT 0")
-    add_column_safe(c, "salary_payments", "payment_type", "TEXT DEFAULT 'monthly'")
-    
-    # Bu sütunlar veritabanında varsa hata vermez, yoksa ekler (Hata koruması için try-except içinde değil, rollback sonrası temiz çalışır)
-    try:
-        c.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS district TEXT")
-        c.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS segment TEXT DEFAULT 'Yeni'")
-        c.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'CONFIRMED'")
-        c.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS rejection_reason TEXT")
-        c.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS service_type TEXT DEFAULT 'Standart'")
-    except psycopg2.Error:
-        conn.rollback() # Sütun zaten varsa ve hata verirse yine temizle
+        # Eksik sütun kontrolleri (Hata verirse yut, devam et)
+        try:
+            c.execute("ALTER TABLE professionals ADD COLUMN IF NOT EXISTS weekly_salary REAL DEFAULT 0")
+            c.execute("ALTER TABLE salary_payments ADD COLUMN IF NOT EXISTS payment_type TEXT DEFAULT 'monthly'")
+            conn.commit()
+        except:
+            conn.rollback()
 
-    conn.commit()
-
+# --- BAŞLATMA ---
 init_db()
 
 # --- FİNANSAL MOTOR ---
@@ -189,10 +189,9 @@ if 'wiz_dates' not in st.session_state: st.session_state.wiz_dates = []
 # ==========================================
 # ANA UYGULAMA
 # ==========================================
-# Uygulama her başladığında bir kez rollback yapalım ki temiz başlasın
+conn = get_db_connection()
 try:
-    conn = get_db_connection()
-    conn.rollback()
+    conn.rollback() # Başlangıçta kilidi aç
 except: pass
 
 with st.sidebar:
@@ -242,7 +241,7 @@ k4.metric(f"📅 Bu Ay Kâr", f"{cmn:,.0f} TL", delta_color="normal")
 st.divider()
 tabs = st.tabs(["⚡ İş Planla", "📅 Öğrenci", "📅 Pro", "📂 Profiller", "📈 Finans", "💸 Ödemeler"])
 
-# --- TAB 1: SİHİRBAZ ---
+# --- TAB 1: SİHİRBAZ (TURBO MODE) ---
 with tabs[0]:
     st.subheader("⚡ Hızlı İş Planlama")
     conn = get_db_connection()
@@ -303,6 +302,7 @@ with tabs[0]:
                 is_pre = 1 if pay_m.startswith("Peşin") else 0
                 is_coll = 1 if is_pre else 0
                 
+                # --- TOPLU INSERT (OPTIMIZATION) ---
                 jobs_to_insert = []
                 first_rec = False
                 
@@ -351,7 +351,6 @@ with tabs[0]:
                     st.success(f"{len(jobs_to_insert)} iş hızlıca oluşturuldu! 🚀")
                     st.session_state.wiz_dates = []
     else: st.warning("Önce müşteri ekleyin.")
-    conn.close()
 
 # --- TAKVİM ---
 def render_cal(type_label):
@@ -450,7 +449,6 @@ def render_cal(type_label):
                                     c.execute("UPDATE jobs SET assigned_pro_id=%s, status='ASSIGNED', price_worker=%s WHERE id=%s",(opts[sel],np,j['id'])); conn.commit(); st.rerun()
                     if st.button("🗑️ Sil", key=f"dl{j['id']}"): c.execute("DELETE FROM jobs WHERE id=%s", (j['id'],)); conn.commit(); st.rerun()
         else: st.info("İş yok")
-    conn.close()
 
 with tabs[1]: render_cal('Öğrenci')
 with tabs[2]: render_cal('Profesyonel')
@@ -567,4 +565,3 @@ with tabs[5]:
                     c.execute("UPDATE jobs SET is_worker_paid=1 WHERE id=%s",(u['id'],)); conn.commit(); st.rerun()
         else: st.info("Borç yok")
     conn.close()
-
