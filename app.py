@@ -23,7 +23,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- VERİTABANI BAĞLANTISI (ZAMAN AŞIMI KORUMALI) ---
+# --- VERİTABANI BAĞLANTISI (OTOMATİK ROLLBACKLİ) ---
 @st.cache_resource
 def get_db_connection():
     try:
@@ -35,7 +35,7 @@ def get_db_connection():
             port=st.secrets["supabase"]["port"],
             cursor_factory=RealDictCursor,
             sslmode='require',
-            connect_timeout=10,  # <-- 10 saniye içinde bağlanamazsa hata verip durur
+            connect_timeout=10,
             keepalives=1,
             keepalives_idle=5,
             keepalives_interval=2,
@@ -43,52 +43,75 @@ def get_db_connection():
         )
         return conn
     except Exception as e:
-        # Hata mesajını ekrana basıp durduruyoruz
-        st.error(f"🔴 Veritabanı Bağlantı Hatası: {e}")
-        st.info("İPUCU: Streamlit Secrets ayarlarında PORT'un 6543 (Pooler) olduğundan emin olun.")
+        st.error(f"Veritabanı Bağlantı Hatası: {e}")
         st.stop()
 
-def add_column_safe(cursor, table, column, type_def):
+# Güvenli sorgu çalıştırma fonksiyonu (Hata olursa rollback yapar)
+def run_query(conn, query, params=None, fetch=False):
     try:
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {type_def}")
-    except psycopg2.Error: pass
+        with conn.cursor() as c:
+            c.execute(query, params)
+            if fetch:
+                return c.fetchall()
+            return None
+    except psycopg2.Error:
+        conn.rollback() # Hata varsa işlemi geri al ve kilidi aç
+        return [] if fetch else None
+
+def add_column_safe(conn, table, column, type_def):
+    # Bu işlem hata verirse (sütun zaten varsa) rollback yaparak devam eder
+    try:
+        with conn.cursor() as c:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_def}")
+            conn.commit()
+    except psycopg2.Error:
+        conn.rollback()
 
 def init_db():
-    # Ekrana bilgi veriyoruz
-    with st.spinner("Veritabanı başlatılıyor..."):
-        conn = get_db_connection()
-        
-        # Olası kilitlenmeleri çöz
-        conn.rollback()
-        
-        c = conn.cursor()
-        
-        # Tablolar
-        c.execute('''CREATE TABLE IF NOT EXISTS customers (id SERIAL PRIMARY KEY, name TEXT, phone TEXT, location TEXT, default_note TEXT, is_regular INTEGER DEFAULT 0, frequency TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS students (id SERIAL PRIMARY KEY, name TEXT, phone TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS cash_inflow (id SERIAL PRIMARY KEY, group_id TEXT, date TEXT, amount REAL, description TEXT, customer_id INTEGER)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS jobs (id SERIAL PRIMARY KEY, group_id TEXT, date TEXT, customer_id INTEGER, job_type TEXT DEFAULT 'student', status TEXT DEFAULT 'OPEN', assigned_student_id INTEGER, assigned_pro_id INTEGER, price_worker REAL DEFAULT 0, price_customer REAL DEFAULT 0, is_worker_paid INTEGER DEFAULT 0, is_collected INTEGER DEFAULT 0, is_prepaid INTEGER DEFAULT 0, job_note TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS availability (user_phone TEXT, date TEXT, is_available INTEGER, UNIQUE(user_phone, date))''')
-        c.execute('''CREATE TABLE IF NOT EXISTS expenses (id SERIAL PRIMARY KEY, date TEXT, description TEXT, amount REAL)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS daily_notes (date TEXT PRIMARY KEY, note TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS professionals (id SERIAL PRIMARY KEY, name TEXT, phone TEXT, salary REAL DEFAULT 0, payment_day INTEGER DEFAULT 1)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS salary_payments (id SERIAL PRIMARY KEY, pro_id INTEGER, amount REAL, payment_date TEXT, month_year TEXT, payment_type TEXT DEFAULT 'monthly')''')
-        c.execute('''CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, date TEXT, type TEXT, category TEXT, amount REAL, description TEXT, related_id INTEGER)''')
-
-        # Eksik sütun kontrolleri (Hata verirse yut, devam et)
+    conn = get_db_connection()
+    conn.rollback() # Başlangıçta temizlik yap
+    
+    # Tabloları oluştur
+    queries = [
+        '''CREATE TABLE IF NOT EXISTS customers (id SERIAL PRIMARY KEY, name TEXT, phone TEXT, location TEXT, default_note TEXT, is_regular INTEGER DEFAULT 0, frequency TEXT)''',
+        '''CREATE TABLE IF NOT EXISTS students (id SERIAL PRIMARY KEY, name TEXT, phone TEXT)''',
+        '''CREATE TABLE IF NOT EXISTS cash_inflow (id SERIAL PRIMARY KEY, group_id TEXT, date TEXT, amount REAL, description TEXT, customer_id INTEGER)''',
+        '''CREATE TABLE IF NOT EXISTS jobs (id SERIAL PRIMARY KEY, group_id TEXT, date TEXT, customer_id INTEGER, job_type TEXT DEFAULT 'student', status TEXT DEFAULT 'OPEN', assigned_student_id INTEGER, assigned_pro_id INTEGER, price_worker REAL DEFAULT 0, price_customer REAL DEFAULT 0, is_worker_paid INTEGER DEFAULT 0, is_collected INTEGER DEFAULT 0, is_prepaid INTEGER DEFAULT 0, job_note TEXT)''',
+        '''CREATE TABLE IF NOT EXISTS availability (user_phone TEXT, date TEXT, is_available INTEGER, UNIQUE(user_phone, date))''',
+        '''CREATE TABLE IF NOT EXISTS expenses (id SERIAL PRIMARY KEY, date TEXT, description TEXT, amount REAL)''',
+        '''CREATE TABLE IF NOT EXISTS daily_notes (date TEXT PRIMARY KEY, note TEXT)''',
+        '''CREATE TABLE IF NOT EXISTS professionals (id SERIAL PRIMARY KEY, name TEXT, phone TEXT, salary REAL DEFAULT 0, payment_day INTEGER DEFAULT 1)''',
+        '''CREATE TABLE IF NOT EXISTS salary_payments (id SERIAL PRIMARY KEY, pro_id INTEGER, amount REAL, payment_date TEXT, month_year TEXT, payment_type TEXT DEFAULT 'monthly')''',
+        '''CREATE TABLE IF NOT EXISTS transactions (id SERIAL PRIMARY KEY, date TEXT, type TEXT, category TEXT, amount REAL, description TEXT, related_id INTEGER)'''
+    ]
+    
+    for q in queries:
         try:
-            c.execute("ALTER TABLE professionals ADD COLUMN IF NOT EXISTS weekly_salary REAL DEFAULT 0")
-            c.execute("ALTER TABLE salary_payments ADD COLUMN IF NOT EXISTS payment_type TEXT DEFAULT 'monthly'")
-            conn.commit()
-        except:
+            with conn.cursor() as c:
+                c.execute(q)
+                conn.commit()
+        except psycopg2.Error:
             conn.rollback()
 
-# --- BAŞLATMA ---
+    # Sütun eklemeleri (Hata verirse geç)
+    add_column_safe(conn, "professionals", "weekly_salary", "REAL DEFAULT 0")
+    add_column_safe(conn, "salary_payments", "payment_type", "TEXT DEFAULT 'monthly'")
+    add_column_safe(conn, "customers", "district", "TEXT")
+    add_column_safe(conn, "customers", "segment", "TEXT DEFAULT 'Yeni'")
+    add_column_safe(conn, "jobs", "status", "TEXT DEFAULT 'CONFIRMED'")
+    add_column_safe(conn, "jobs", "rejection_reason", "TEXT")
+    add_column_safe(conn, "jobs", "service_type", "TEXT DEFAULT 'Standart'")
+
+# Başlat
 init_db()
 
 # --- FİNANSAL MOTOR ---
 def calculate_obligations():
     conn = get_db_connection()
+    # Kilitlenmeye karşı önlem:
+    if conn.closed: st.cache_resource.clear(); conn = get_db_connection()
+    conn.rollback() # Her hesaplamadan önce temizle
+    
     c = conn.cursor()
     today = datetime.now().date()
     
@@ -121,6 +144,10 @@ def calculate_obligations():
 
 def calculate_monthly_profit(month, year):
     conn = get_db_connection()
+    # Kilitlenmeye karşı önlem:
+    if conn.closed: st.cache_resource.clear(); conn = get_db_connection()
+    conn.rollback() # Her hesaplamadan önce temizle (BU SATIR HATAYI ÇÖZER)
+    
     c = conn.cursor()
     date_pattern = f"%.{month:02d}.{year}"
     
@@ -132,6 +159,7 @@ def calculate_monthly_profit(month, year):
     res = c.fetchone()
     exp_jobs = float(res['sum']) if res and res['sum'] else 0.0
     
+    # Hata veren yer burasıydı, artık rollback olduğu için çalışacak
     c.execute("SELECT SUM(amount) FROM transactions WHERE type='income' AND date LIKE %s", (date_pattern,))
     res = c.fetchone()
     inc_ext = float(res['sum']) if res and res['sum'] else 0.0
@@ -156,6 +184,7 @@ def calculate_monthly_profit(month, year):
 
 def get_financial_report_df():
     conn = get_db_connection()
+    conn.rollback()
     c = conn.cursor()
     data = []
     
@@ -190,9 +219,7 @@ if 'wiz_dates' not in st.session_state: st.session_state.wiz_dates = []
 # ANA UYGULAMA
 # ==========================================
 conn = get_db_connection()
-try:
-    conn.rollback() # Başlangıçta kilidi aç
-except: pass
+conn.rollback() # EN BAŞTA KİLİDİ AÇ
 
 with st.sidebar:
     st.title("📊 Yönetim")
@@ -241,7 +268,7 @@ k4.metric(f"📅 Bu Ay Kâr", f"{cmn:,.0f} TL", delta_color="normal")
 st.divider()
 tabs = st.tabs(["⚡ İş Planla", "📅 Öğrenci", "📅 Pro", "📂 Profiller", "📈 Finans", "💸 Ödemeler"])
 
-# --- TAB 1: SİHİRBAZ (TURBO MODE) ---
+# --- TAB 1: SİHİRBAZ ---
 with tabs[0]:
     st.subheader("⚡ Hızlı İş Planlama")
     conn = get_db_connection()
@@ -302,7 +329,6 @@ with tabs[0]:
                 is_pre = 1 if pay_m.startswith("Peşin") else 0
                 is_coll = 1 if is_pre else 0
                 
-                # --- TOPLU INSERT (OPTIMIZATION) ---
                 jobs_to_insert = []
                 first_rec = False
                 
@@ -351,6 +377,7 @@ with tabs[0]:
                     st.success(f"{len(jobs_to_insert)} iş hızlıca oluşturuldu! 🚀")
                     st.session_state.wiz_dates = []
     else: st.warning("Önce müşteri ekleyin.")
+    conn.close()
 
 # --- TAKVİM ---
 def render_cal(type_label):
@@ -449,6 +476,7 @@ def render_cal(type_label):
                                     c.execute("UPDATE jobs SET assigned_pro_id=%s, status='ASSIGNED', price_worker=%s WHERE id=%s",(opts[sel],np,j['id'])); conn.commit(); st.rerun()
                     if st.button("🗑️ Sil", key=f"dl{j['id']}"): c.execute("DELETE FROM jobs WHERE id=%s", (j['id'],)); conn.commit(); st.rerun()
         else: st.info("İş yok")
+    conn.close()
 
 with tabs[1]: render_cal('Öğrenci')
 with tabs[2]: render_cal('Profesyonel')
