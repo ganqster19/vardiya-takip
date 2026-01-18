@@ -7,7 +7,39 @@ import uuid
 from datetime import datetime, timedelta, date
 
 st.set_page_config(page_title="Vardiya & Talep Yönetimi", page_icon="⚡", layout="wide")
-
+# --- BU KODU app.py DOSYASININ EN ÜSTÜNE (st.set_page_config ALTINA) YAPIŞTIR ---
+# --- VERİTABANI ONARIM BLOĞU BAŞLANGICI ---
+try:
+    # Geçici bağlantı
+    temp_conn = psycopg2.connect(
+        host=st.secrets["supabase"]["host"],
+        database=st.secrets["supabase"]["dbname"],
+        user=st.secrets["supabase"]["user"],
+        password=st.secrets["supabase"]["password"],
+        port=st.secrets["supabase"]["port"],
+        sslmode='require'
+    )
+    temp_c = temp_conn.cursor()
+    
+    # Eksik sütunları ekle (Varsa hata vermez, yoksa ekler)
+    st.info("Veritabanı eksikleri kontrol ediliyor...")
+    
+    # Müşteri Tablosu Eksikleri
+    temp_c.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS district TEXT;")
+    temp_c.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS segment TEXT DEFAULT 'Yeni';")
+    
+    # İşler Tablosu Eksikleri
+    temp_c.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'CONFIRMED';")
+    temp_c.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS rejection_reason TEXT;")
+    temp_c.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS service_type TEXT DEFAULT 'Standart';")
+    
+    temp_conn.commit()
+    temp_conn.close()
+    st.success("✅ Veritabanı başarıyla güncellendi! Artık hatasız çalışacak.")
+    
+except Exception as e:
+    st.warning(f"Onarım sırasında not: {e}")
+# --- VERİTABANI ONARIM BLOĞU BİTİŞİ ---
 # --- CSS ---
 st.markdown("""
 <style>
@@ -292,3 +324,4 @@ with tabs[2]:
     cust_df = pd.DataFrame(c.fetchall())
     if not cust_df.empty:
         st.dataframe(cust_df[['name', 'phone', 'district', 'segment']], use_container_width=True)
+
